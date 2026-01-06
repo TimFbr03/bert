@@ -1,71 +1,121 @@
-import numpy as np
 import torch
+import torch.nn as nn
 import mlflow
 import mlflow.pytorch
 
-from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.metrics import f1_score
 
 from transformers import (
+    AutoModel,
     AutoTokenizer,
-    AutoModelForSequenceClassification,
     Trainer,
     TrainingArguments,
     DataCollatorWithPadding,
 )
 
 # --------------------------------------------------
-# Metrics for multi-label classification
+# Multi-head model
+# --------------------------------------------------
+class MultiHeadXLMRoberta(nn.Module):
+    def __init__(self, model_name, num_type, num_queue, num_priority):
+        super().__init__()
+
+        self.encoder = AutoModel.from_pretrained(model_name)
+        hidden_size = self.encoder.config.hidden_size
+
+        self.dropout = nn.Dropout(0.1)
+
+        self.type_head = nn.Linear(hidden_size, num_type)
+        self.queue_head = nn.Linear(hidden_size, num_queue)
+        self.priority_head = nn.Linear(hidden_size, num_priority)
+
+        self.loss_fct = nn.CrossEntropyLoss()
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        pooled = outputs.last_hidden_state[:, 0]
+        pooled = self.dropout(pooled)
+
+        logits = {
+            "type": self.type_head(pooled),
+            "queue": self.queue_head(pooled),
+            "priority": self.priority_head(pooled),
+        }
+
+        loss = None
+        if labels is not None:
+            loss = (
+                self.loss_fct(logits["type"], labels["type"])
+                + self.loss_fct(logits["queue"], labels["queue"])
+                + self.loss_fct(logits["priority"], labels["priority"])
+            )
+
+        return {
+            "loss": loss,
+            "logits": logits,
+        }
+
+
+# --------------------------------------------------
+# Custom Trainer
+# --------------------------------------------------
+class MultiHeadTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs, labels=labels)
+        loss = outputs["loss"]
+        return (loss, outputs) if return_outputs else loss
+
+
+# --------------------------------------------------
+# Metrics (per head)
 # --------------------------------------------------
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
 
-    probs = torch.sigmoid(torch.tensor(logits)).numpy()
-    preds = (probs >= 0.5).astype(int)
+    metrics = {}
 
-    return {
-        "f1_micro": f1_score(labels, preds, average="micro", zero_division=0),
-        "f1_macro": f1_score(labels, preds, average="macro", zero_division=0),
-        "precision_micro": precision_score(labels, preds, average="micro", zero_division=0),
-        "recall_micro": recall_score(labels, preds, average="micro", zero_division=0),
-    }
+    for head in ["type", "queue", "priority"]:
+        preds = logits[head].argmax(axis=1)
+        metrics[f"{head}_f1_macro"] = f1_score(
+            labels[head],
+            preds,
+            average="macro",
+            zero_division=0,
+        )
+
+    metrics["f1_macro_mean"] = sum(
+        metrics[f"{h}_f1_macro"] for h in ["type", "queue", "priority"]
+    ) / 3
+
+    return metrics
 
 
-def train_model(tokenized_ds, mlb, label_names, metadata):
-    # --------------------------------------------------
-    # Configuration
-    # --------------------------------------------------
+# --------------------------------------------------
+# Training entry point
+# --------------------------------------------------
+def train_model(tokenized_ds, metadata):
     model_name = "FacebookAI/xlm-roberta-base"
     output_dir = "./xlm-roberta-customer-support"
     final_model_dir = f"{output_dir}/final"
 
-    num_labels = metadata["num_labels"]
+    mlflow.set_experiment("xlm-roberta-multihead-customer-support")
 
-    label2id = {label: i for i, label in enumerate(label_names)}
-    id2label = {i: label for label, i in label2id.items()}
-
-    # --------------------------------------------------
-    # MLflow setup
-    # --------------------------------------------------
-    mlflow.set_experiment("xlm-roberta-multilabel-customer-support")
-
-    # --------------------------------------------------
-    # Tokenizer & model
-    # --------------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name,
-        num_labels=num_labels,
-        id2label=id2label,
-        label2id=label2id,
-        problem_type="multi_label_classification",
+    model = MultiHeadXLMRoberta(
+        model_name=model_name,
+        num_type=metadata["num_type"],
+        num_queue=metadata["num_queue"],
+        num_priority=metadata["num_priority"],
     )
 
     data_collator = DataCollatorWithPadding(tokenizer)
 
-    # --------------------------------------------------
-    # Training arguments
-    # --------------------------------------------------
     training_args = TrainingArguments(
         output_dir=output_dir,
         evaluation_strategy="epoch",
@@ -80,70 +130,56 @@ def train_model(tokenized_ds, mlb, label_names, metadata):
         logging_dir="./logs",
         logging_steps=50,
         load_best_model_at_end=True,
-        metric_for_best_model="f1_micro",
+        metric_for_best_model="f1_macro_mean",
         save_total_limit=2,
         fp16=True,
-        report_to="none",  # IMPORTANT: manual MLflow logging
-        push_to_hub=False,
+        report_to="none",
     )
 
-    trainer = Trainer(
+    trainer = MultiHeadTrainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_ds["train"],
-        eval_dataset=tokenized_ds.get("validation") or tokenized_ds["test"],
+        eval_dataset=tokenized_ds["validation"],
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
 
-    # --------------------------------------------------
-    # MLflow run
-    # --------------------------------------------------
     with mlflow.start_run():
 
-        # -------- Parameters --------
+        # -------- Params --------
         mlflow.log_param("model_name", model_name)
-        mlflow.log_param("num_labels", num_labels)
+        mlflow.log_param("num_type", metadata["num_type"])
+        mlflow.log_param("num_queue", metadata["num_queue"])
+        mlflow.log_param("num_priority", metadata["num_priority"])
         mlflow.log_param("learning_rate", training_args.learning_rate)
         mlflow.log_param("train_batch_size", training_args.per_device_train_batch_size)
-        mlflow.log_param("eval_batch_size", training_args.per_device_eval_batch_size)
-        mlflow.log_param("gradient_accumulation_steps", training_args.gradient_accumulation_steps)
-        mlflow.log_param("num_train_epochs", training_args.num_train_epochs)
-        mlflow.log_param("weight_decay", training_args.weight_decay)
-        mlflow.log_param("warmup_ratio", training_args.warmup_ratio)
-        mlflow.log_param("fp16", training_args.fp16)
+        mlflow.log_param("epochs", training_args.num_train_epochs)
 
         # -------- Training --------
         trainer.train()
 
         # -------- Evaluation --------
         eval_metrics = trainer.evaluate()
-        for key, value in eval_metrics.items():
-            if isinstance(value, (int, float)):
-                mlflow.log_metric(key, value)
+        for k, v in eval_metrics.items():
+            if isinstance(v, (float, int)):
+                mlflow.log_metric(k, v)
 
-        # -------- Save model --------
+        # -------- Save --------
         trainer.save_model(final_model_dir)
         tokenizer.save_pretrained(final_model_dir)
 
-        # -------- Log artifacts --------
         mlflow.pytorch.log_model(
             pytorch_model=model,
             artifact_path="model",
         )
 
-        mlflow.log_artifacts(final_model_dir, artifact_path="hf_model")
 
-
+# --------------------------------------------------
+# Guard
+# --------------------------------------------------
 if __name__ == "__main__":
-    """
-    Expected to be called with already prepared objects, e.g. from a pipeline:
-        - tokenized_ds: DatasetDict
-        - mlb: MultiLabelBinarizer
-        - label_names: list[str]
-        - metadata: dict (must include 'num_labels')
-    """
     raise RuntimeError(
-        "train_model(...) must be called from the training pipeline with prepared datasets."
+        "train_model(...) must be called from the pipeline with prepared datasets."
     )
