@@ -1,185 +1,226 @@
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+from transformers import AutoModel, get_linear_schedule_with_warmup
 import mlflow
 import mlflow.pytorch
-
 from sklearn.metrics import f1_score
+from collections import defaultdict
+import numpy as np
 
-from transformers import (
-    AutoModel,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-    DataCollatorWithPadding,
-)
+from data.get_data import load_data
 
 # --------------------------------------------------
-# Multi-head model
+# Configuration
 # --------------------------------------------------
-class MultiHeadXLMRoberta(nn.Module):
+BATCH_SIZE = 8
+EPOCHS = 4
+LEARNING_RATE = 2e-5
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.1
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Loss scaling (tune later if needed)
+LOSS_WEIGHTS = {
+    "type": 1.0,
+    "queue": 1.5,      # most imbalanced / critical
+    "priority": 1.0,
+}
+
+# --------------------------------------------------
+# Multi-head RoBERTa model
+# --------------------------------------------------
+class RobertaMultiHead(nn.Module):
     def __init__(self, model_name, num_type, num_queue, num_priority):
         super().__init__()
 
         self.encoder = AutoModel.from_pretrained(model_name)
-        hidden_size = self.encoder.config.hidden_size
+        hidden = self.encoder.config.hidden_size
 
-        self.dropout = nn.Dropout(0.1)
+        self.type_head = nn.Linear(hidden, num_type)
+        self.queue_head = nn.Linear(hidden, num_queue)
+        self.priority_head = nn.Linear(hidden, num_priority)
 
-        self.type_head = nn.Linear(hidden_size, num_type)
-        self.queue_head = nn.Linear(hidden_size, num_queue)
-        self.priority_head = nn.Linear(hidden_size, num_priority)
-
-        self.loss_fct = nn.CrossEntropyLoss()
-
-    def forward(self, input_ids, attention_mask, labels=None):
+    def forward(self, input_ids, attention_mask):
         outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
-        pooled = outputs.last_hidden_state[:, 0]
-        pooled = self.dropout(pooled)
-
-        logits = {
-            "type": self.type_head(pooled),
-            "queue": self.queue_head(pooled),
-            "priority": self.priority_head(pooled),
-        }
-
-        loss = None
-        if labels is not None:
-            loss = (
-                self.loss_fct(logits["type"], labels["type"])
-                + self.loss_fct(logits["queue"], labels["queue"])
-                + self.loss_fct(logits["priority"], labels["priority"])
-            )
+        cls = outputs.last_hidden_state[:, 0]
 
         return {
-            "loss": loss,
-            "logits": logits,
+            "type": self.type_head(cls),
+            "queue": self.queue_head(cls),
+            "priority": self.priority_head(cls),
         }
 
 
 # --------------------------------------------------
-# Custom Trainer
+# Utilities
 # --------------------------------------------------
-class MultiHeadTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        labels = inputs.pop("labels")
-        outputs = model(**inputs, labels=labels)
-        loss = outputs["loss"]
-        return (loss, outputs) if return_outputs else loss
+def compute_class_weights(class_counts: dict):
+    weights = {}
+    for head, counts in class_counts.items():
+        total = sum(counts.values())
+        num_classes = len(counts)
+        weights[head] = torch.tensor(
+            [total / (num_classes * counts[i]) for i in range(num_classes)],
+            dtype=torch.float,
+            device=DEVICE,
+        )
+    return weights
 
 
-# --------------------------------------------------
-# Metrics (per head)
-# --------------------------------------------------
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
+def collate_fn(batch):
+    return {
+        "input_ids": torch.stack([x["input_ids"] for x in batch]),
+        "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
+        "labels": {
+            "type": torch.tensor([x["type_label"] for x in batch]),
+            "queue": torch.tensor([x["queue_label"] for x in batch]),
+            "priority": torch.tensor([x["priority_label"] for x in batch]),
+        },
+    }
+
+
+def evaluate(model, dataloader, device):
+    model.eval()
+    preds = defaultdict(list)
+    labels = defaultdict(list)
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            batch_labels = batch["labels"]
+
+            outputs = model(input_ids, attention_mask)
+
+            for head in outputs:
+                preds[head].extend(outputs[head].argmax(dim=1).cpu().numpy())
+                labels[head].extend(batch_labels[head].numpy())
 
     metrics = {}
-
-    for head in ["type", "queue", "priority"]:
-        preds = logits[head].argmax(axis=1)
-        metrics[f"{head}_f1_macro"] = f1_score(
+    for head in preds:
+        metrics[f"{head}_macro_f1"] = f1_score(
             labels[head],
-            preds,
+            preds[head],
             average="macro",
-            zero_division=0,
         )
-
-    metrics["f1_macro_mean"] = sum(
-        metrics[f"{h}_f1_macro"] for h in ["type", "queue", "priority"]
-    ) / 3
 
     return metrics
 
 
 # --------------------------------------------------
-# Training entry point
+# Training
 # --------------------------------------------------
-def train_model(tokenized_ds, metadata):
-    model_name = "FacebookAI/xlm-roberta-base"
-    output_dir = "./xlm-roberta-customer-support"
-    final_model_dir = f"{output_dir}/final"
+def train():
+    datasets, tokenizer, metadata = load_data()
 
-    mlflow.set_experiment("xlm-roberta-multihead-customer-support")
+    train_loader = DataLoader(
+        datasets["train"],
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn,
+    )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    val_loader = DataLoader(
+        datasets["validation"],
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
 
-    model = MultiHeadXLMRoberta(
-        model_name=model_name,
+    model = RobertaMultiHead(
+        model_name=metadata["model_name"],
         num_type=metadata["num_type"],
         num_queue=metadata["num_queue"],
         num_priority=metadata["num_priority"],
+    ).to(DEVICE)
+
+    class_weights = compute_class_weights(metadata["class_counts"])
+
+    losses = {
+        head: nn.CrossEntropyLoss(weight=class_weights[head])
+        for head in class_weights
+    }
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
     )
 
-    data_collator = DataCollatorWithPadding(tokenizer)
-
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        learning_rate=2e-5,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=16,
-        gradient_accumulation_steps=2,
-        num_train_epochs=3,
-        weight_decay=0.01,
-        warmup_ratio=0.1,
-        logging_dir="./logs",
-        logging_steps=50,
-        load_best_model_at_end=True,
-        metric_for_best_model="f1_macro_mean",
-        save_total_limit=2,
-        fp16=True,
-        report_to="none",
+    total_steps = len(train_loader) * EPOCHS
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(WARMUP_RATIO * total_steps),
+        num_training_steps=total_steps,
     )
 
-    trainer = MultiHeadTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_ds["train"],
-        eval_dataset=tokenized_ds["validation"],
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
+    # --------------------------------------------------
+    # MLflow
+    # --------------------------------------------------
+    mlflow.start_run()
+    mlflow.log_params({
+        "model": metadata["model_name"],
+        "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS,
+        "lr": LEARNING_RATE,
+        "warmup_ratio": WARMUP_RATIO,
+    })
 
-    with mlflow.start_run():
+    # --------------------------------------------------
+    # Epoch loop
+    # --------------------------------------------------
+    for epoch in range(EPOCHS):
+        model.train()
+        epoch_loss = 0.0
 
-        # -------- Params --------
-        mlflow.log_param("model_name", model_name)
-        mlflow.log_param("num_type", metadata["num_type"])
-        mlflow.log_param("num_queue", metadata["num_queue"])
-        mlflow.log_param("num_priority", metadata["num_priority"])
-        mlflow.log_param("learning_rate", training_args.learning_rate)
-        mlflow.log_param("train_batch_size", training_args.per_device_train_batch_size)
-        mlflow.log_param("epochs", training_args.num_train_epochs)
+        for batch in train_loader:
+            optimizer.zero_grad()
 
-        # -------- Training --------
-        trainer.train()
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+            labels = batch["labels"]
 
-        # -------- Evaluation --------
-        eval_metrics = trainer.evaluate()
-        for k, v in eval_metrics.items():
-            if isinstance(v, (float, int)):
-                mlflow.log_metric(k, v)
+            outputs = model(input_ids, attention_mask)
 
-        # -------- Save --------
-        trainer.save_model(final_model_dir)
-        tokenizer.save_pretrained(final_model_dir)
+            loss = 0.0
+            for head in outputs:
+                head_loss = losses[head](
+                    outputs[head],
+                    labels[head].to(DEVICE),
+                )
+                loss += LOSS_WEIGHTS[head] * head_loss
 
-        mlflow.pytorch.log_model(
-            pytorch_model=model,
-            artifact_path="model",
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(train_loader)
+
+        val_metrics = evaluate(model, val_loader, DEVICE)
+
+        mlflow.log_metric("train_loss", avg_loss, step=epoch)
+        for k, v in val_metrics.items():
+            mlflow.log_metric(f"val_{k}", v, step=epoch)
+
+        print(
+            f"Epoch {epoch + 1}/{EPOCHS} | "
+            f"Loss: {avg_loss:.4f} | "
+            + " | ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items())
         )
 
+    mlflow.pytorch.log_model(model, "model")
+    mlflow.end_run()
+
 
 # --------------------------------------------------
-# Guard
+# Entry point
 # --------------------------------------------------
 if __name__ == "__main__":
-    raise RuntimeError(
-        "train_model(...) must be called from the pipeline with prepared datasets."
-    )
+    train()
