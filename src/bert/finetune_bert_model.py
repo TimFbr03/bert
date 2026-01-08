@@ -5,31 +5,31 @@ from transformers import AutoModel, get_linear_schedule_with_warmup
 import mlflow
 import mlflow.pytorch
 from sklearn.metrics import f1_score
+from sklearn.metrics import classification_report
 from collections import defaultdict
 import numpy as np
 
 from data.get_data import load_data
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+# Config
 BATCH_SIZE = 8
 EPOCHS = 4
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EXPERIMENT_NAME = "" # Link einfügen
 
-# Loss scaling (tune later if needed)
+mlflow.set_experiment(EXPERIMENT_NAME)
+
+# Loss scaling
 LOSS_WEIGHTS = {
     "type": 1.0,
-    "queue": 1.5,      # most imbalanced / critical
+    "queue": 1.5,
     "priority": 1.0,
 }
 
-# --------------------------------------------------
-# Multi-head RoBERTa model
-# --------------------------------------------------
+
 class RobertaMultiHead(nn.Module):
     def __init__(self, model_name, num_type, num_queue, num_priority):
         super().__init__()
@@ -56,9 +56,7 @@ class RobertaMultiHead(nn.Module):
         }
 
 
-# --------------------------------------------------
-# Utilities
-# --------------------------------------------------
+# Utils
 def compute_class_weights(class_counts: dict):
     weights = {}
     for head, counts in class_counts.items():
@@ -84,7 +82,7 @@ def collate_fn(batch):
     }
 
 
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, label_names):
     model.eval()
     preds = defaultdict(list)
     labels = defaultdict(list)
@@ -102,125 +100,125 @@ def evaluate(model, dataloader, device):
                 labels[head].extend(batch_labels[head].numpy())
 
     metrics = {}
+
     for head in preds:
-        metrics[f"{head}_macro_f1"] = f1_score(
+        report = classification_report(
             labels[head],
             preds[head],
-            average="macro",
+            output_dict=True,
+            zero_division=0,
         )
+
+        metrics[f"{head}_macro_f1"] = report["macro avg"]["f1-score"]
+
+        # per-class recall & precision
+        for class_id, stats in report.items():
+            if class_id.isdigit():
+                class_name = label_names[head][int(class_id)]
+                metrics[f"{head}_recall/{class_name}"] = stats["recall"]
+                metrics[f"{head}_precision/{class_name}"] = stats["precision"]
+                metrics[f"{head}_support/{class_name}"] = stats["support"]
 
     return metrics
 
-
-# --------------------------------------------------
-# Training
-# --------------------------------------------------
+# Training loop
 def train():
-    datasets, tokenizer, metadata = load_data()
+    with mlflow.start_run():
 
-    train_loader = DataLoader(
-        datasets["train"],
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        collate_fn=collate_fn,
-    )
+        datasets, tokenizer, metadata = load_data()
 
-    val_loader = DataLoader(
-        datasets["validation"],
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        collate_fn=collate_fn,
-    )
+        mlflow.log_params({
+            "model": metadata["model_name"],
+            "batch_size": BATCH_SIZE,
+            "epochs": EPOCHS,
+            "learning_rate": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "warmup_ratio": WARMUP_RATIO,
+            "max_length": metadata["max_length"],
+        })
 
-    model = RobertaMultiHead(
-        model_name=metadata["model_name"],
-        num_type=metadata["num_type"],
-        num_queue=metadata["num_queue"],
-        num_priority=metadata["num_priority"],
-    ).to(DEVICE)
-
-    class_weights = compute_class_weights(metadata["class_counts"])
-
-    losses = {
-        head: nn.CrossEntropyLoss(weight=class_weights[head])
-        for head in class_weights
-    }
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
-
-    total_steps = len(train_loader) * EPOCHS
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(WARMUP_RATIO * total_steps),
-        num_training_steps=total_steps,
-    )
-
-    # --------------------------------------------------
-    # MLflow
-    # --------------------------------------------------
-    mlflow.start_run()
-    mlflow.log_params({
-        "model": metadata["model_name"],
-        "batch_size": BATCH_SIZE,
-        "epochs": EPOCHS,
-        "lr": LEARNING_RATE,
-        "warmup_ratio": WARMUP_RATIO,
-    })
-
-    # --------------------------------------------------
-    # Epoch loop
-    # --------------------------------------------------
-    for epoch in range(EPOCHS):
-        model.train()
-        epoch_loss = 0.0
-
-        for batch in train_loader:
-            optimizer.zero_grad()
-
-            input_ids = batch["input_ids"].to(DEVICE)
-            attention_mask = batch["attention_mask"].to(DEVICE)
-            labels = batch["labels"]
-
-            outputs = model(input_ids, attention_mask)
-
-            loss = 0.0
-            for head in outputs:
-                head_loss = losses[head](
-                    outputs[head],
-                    labels[head].to(DEVICE),
-                )
-                loss += LOSS_WEIGHTS[head] * head_loss
-
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            epoch_loss += loss.item()
-
-        avg_loss = epoch_loss / len(train_loader)
-
-        val_metrics = evaluate(model, val_loader, DEVICE)
-
-        mlflow.log_metric("train_loss", avg_loss, step=epoch)
-        for k, v in val_metrics.items():
-            mlflow.log_metric(f"val_{k}", v, step=epoch)
-
-        print(
-            f"Epoch {epoch + 1}/{EPOCHS} | "
-            f"Loss: {avg_loss:.4f} | "
-            + " | ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items())
+        train_loader = DataLoader(
+            datasets["train"],
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            collate_fn=collate_fn,
         )
 
-    mlflow.pytorch.log_model(model, "model")
-    mlflow.end_run()
+        val_loader = DataLoader(
+            datasets["validation"],
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            collate_fn=collate_fn,
+        )
 
+        model = RobertaMultiHead(
+            model_name=metadata["model_name"],
+            num_type=metadata["num_type"],
+            num_queue=metadata["num_queue"],
+            num_priority=metadata["num_priority"],
+        ).to(DEVICE)
 
-# --------------------------------------------------
-# Entry point
-# --------------------------------------------------
+        class_weights = compute_class_weights(metadata["class_counts"])
+
+        losses = {
+            head: nn.CrossEntropyLoss(weight=class_weights[head])
+            for head in class_weights
+        }
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY,
+        )
+
+        total_steps = len(train_loader) * EPOCHS
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(WARMUP_RATIO * total_steps),
+            num_training_steps=total_steps,
+        )
+
+        for epoch in range(EPOCHS):
+            model.train()
+            epoch_loss = 0.0
+
+            for batch in train_loader:
+                optimizer.zero_grad()
+
+                input_ids = batch["input_ids"].to(DEVICE)
+                attention_mask = batch["attention_mask"].to(DEVICE)
+                labels = batch["labels"]
+
+                outputs = model(input_ids, attention_mask)
+
+                loss = 0.0
+                for head in outputs:
+                    head_loss = losses[head](
+                        outputs[head],
+                        labels[head].to(DEVICE),
+                    )
+                    loss += LOSS_WEIGHTS[head] * head_loss
+
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                epoch_loss += loss.item()
+
+            avg_loss = epoch_loss / len(train_loader)
+            val_metrics = evaluate(model, val_loader, DEVICE)
+
+            mlflow.log_metric("train_loss", avg_loss, step=epoch)
+            for k, v in val_metrics.items():
+                mlflow.log_metric(f"val_{k}", v, step=epoch)
+
+            print(
+                f"Epoch {epoch + 1}/{EPOCHS} | "
+                f"Loss: {avg_loss:.4f} | "
+                + " | ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items())
+            )
+
+        mlflow.pytorch.log_model(model, "model")
+
 if __name__ == "__main__":
     train()

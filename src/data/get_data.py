@@ -3,6 +3,8 @@ from transformers import RobertaTokenizer
 from sklearn.model_selection import train_test_split
 import pandas as pd
 import torch
+import mlflow
+import mlflow.data
 
 # --------------------------------------------------
 # Configuration
@@ -197,6 +199,23 @@ def load_data():
     class_counts = compute_class_counts(df)
 
     train_df, val_df, test_df = split_dataset(df)
+
+    # --------------------------------------------------
+    # MLflow Dataset logging (PRE-TOKENIZATION)
+    # --------------------------------------------------
+    if mlflow.active_run() is not None:
+        for split_name, split_df in {
+            "train": train_df,
+            "validation": val_df,
+            "test": test_df,
+        }.items():
+            dataset = mlflow.data.from_pandas(
+                split_df,
+                name="customer-support-tickets-it",
+                source="hf://Tobi-Bueck/customer-support-tickets",
+            )
+            mlflow.log_input(dataset, context=split_name)
+
 
     tokenized_datasets, tokenizer = tokenize_dataset(
         train_df, val_df, test_df
